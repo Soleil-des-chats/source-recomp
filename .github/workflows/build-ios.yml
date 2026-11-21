@@ -1,0 +1,187 @@
+name: Build iOS IPA (unsigned)
+
+# Put this file in a PRIVATE repo at .github/workflows/build-ios.yml
+# The repo itself contains nothing else: the workflow clones the upstream
+# project and downloads YOUR Linux depot from a private release of this repo.
+#
+# One-time prep (on any PC, no Mac needed):
+#   1. In the Steam console:  download_depot 620 661   (HL2: 220 224, Portal: 400 404)
+#   2. Zip the CONTENTS of the folder Steam created (…/content/app_620/depot_661/)
+#      so that bin/linux32/engine.so is at the root of the zip -> depot_661.zip
+#   3. In your private repo: Releases > new release, tag "depots",
+#      attach depot_661.zip (the asset name must be depot_<id>.zip)
+
+on:
+  workflow_dispatch:
+    inputs:
+      game:
+        description: Game to build
+        type: choice
+        default: portal2
+        options: [portal2, hl2, portal1]
+      upstream_ref:
+        description: Upstream branch, tag or commit of kanapitsas/source-recomp
+        default: main
+      bundle_id:
+        description: Bundle identifier (your sideloader may rewrite it anyway)
+        default: local.recomp.sideload
+      metal:
+        description: Build the Metal renderer (needs Rust, ~5 extra minutes). Off = OpenGL
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15        # arm64, Xcode 16 with the iOS 18 SDK
+    timeout-minutes: 180
+    env:
+      GAME: ${{ inputs.game }}
+      BUNDLE_ID: ${{ inputs.bundle_id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Pick the newest Xcode (iOS 18 SDK)
+        run: |
+          ls -d /Applications/Xcode_*.app | sort -V | tail -5
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)/Contents/Developer"
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Clone upstream source-recomp
+        run: |
+          git clone https://github.com/kanapitsas/source-recomp.git src
+          git -C src checkout "${{ inputs.upstream_ref }}"
+          git -C src log -1 --oneline
+
+      - name: Download your Linux depot (private release)
+        run: |
+          case "$GAME" in
+            portal2) DEPOT=661 ;;
+            hl2)     DEPOT=224 ;;
+            portal1) DEPOT=404 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/linux"
+          gh release download depots --repo "$GITHUB_REPOSITORY" \
+             --pattern "depot_${DEPOT}.zip" --dir "$RUNNER_TEMP"
+          unzip -q "$RUNNER_TEMP/depot_${DEPOT}.zip" -d "$RUNNER_TEMP/linux"
+          rm "$RUNNER_TEMP/depot_${DEPOT}.zip"
+          L="$RUNNER_TEMP/linux"
+          case "$GAME" in
+            portal2) test -f "$L/bin/linux32/engine.so" && test -f "$L/portal2/bin/linux32/server.so" ;;
+            hl2)     test -f "$L/hl2_linux" && test -f "$L/bin/engine.so" && test -f "$L/hl2_complete/bin/server.so" ;;
+            portal1) test -f "$L/hl2_linux" && test -f "$L/bin/engine.so" && test -f "$L/portal/bin/server.so" && test -f "$L/bin/shaderapivk.so" ;;
+          esac || { echo "::error::depot zip does not have the expected layout (files must be at the zip root)"; exit 1; }
+
+      - name: Tools
+        run: |
+          brew install cmake ninja || true
+          python3 --version
+          echo "LINUX_ROOT=$RUNNER_TEMP/linux" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/game-stub"      # game data is NOT needed to build, it goes on the phone later
+          echo "GAME_ROOT=$RUNNER_TEMP/game-stub" >> "$GITHUB_ENV"
+
+      - name: Cache Rust + iOS deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            src/deps/ios-deps
+            src/deps/mtld3d-native/native/target
+          key: ios-${{ runner.os }}-${{ hashFiles('src/ios/deps/**', 'src/setup.sh') }}
+
+      - name: Build libd3d9metal for iOS (Metal renderer)
+        if: ${{ inputs.metal }}
+        continue-on-error: true   # on failure the app simply uses OpenGL
+        working-directory: src
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-ios
+          REV=$(grep '^MTLD3D_REV=' setup.sh | cut -d'"' -f2)     # stays in sync with upstream
+          URL=$(grep '^MTLD3D_URL=' setup.sh | cut -d'"' -f2)
+          SRC=deps/mtld3d-native
+          mkdir -p "$SRC" && cd "$SRC"
+          [ "$(git rev-parse HEAD 2>/dev/null)" = "$REV" ] || {
+            git init -q && git fetch -q --depth 1 "$URL" "$REV" && git checkout -q --force FETCH_HEAD; }
+          cd native
+          CARGO_TARGET_DIR="$PWD/target" cargo build --profile production --target aarch64-apple-ios
+          ls -l target/aarch64-apple-ios/production/libd3d9metal.a
+          echo "METAL_LIB=$PWD/target/aarch64-apple-ios/production/libd3d9metal.a" >> "$GITHUB_ENV"
+
+      - name: Write config/local.json
+        working-directory: src
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          game = os.environ['GAME']
+          cfg = {}
+          sec = dict(game_root=os.environ['GAME_ROOT'],
+                     linux_root=os.environ['LINUX_ROOT'],
+                     ios_bundle_id=os.environ['BUNDLE_ID'])
+          if game == 'portal2':
+              cfg.update(sec)                       # Portal 2 lives at the top level
+          else:
+              cfg['games'] = {game: sec}            # other games under "games"
+          lib = os.environ.get('METAL_LIB')
+          if lib and os.path.isfile(lib):
+              cfg['d3d9metal_ios'] = {'device': lib}
+          os.makedirs('config', exist_ok=True)
+          json.dump(cfg, open('config/local.json', 'w'), indent=2)
+          print(json.dumps(cfg, indent=2))
+          EOF
+
+      - name: Disable code signing (the sideloader signs later)
+        working-directory: src
+        run: |
+          # Replaces ios/signing/sign.py by a no-op that also works if it is imported.
+          cat > ios/signing/sign.py <<'EOF'
+          import sys
+          def __getattr__(name):
+              return lambda *a, **k: 0
+          if __name__ == "__main__":
+              print("signing skipped: unsigned IPA")
+              sys.exit(0)
+          EOF
+
+      - name: Prepare modules and build iOS dependencies
+        working-directory: src
+        run: |
+          python3 tools/gameprep.py --game "$GAME"
+          IOS_DEPS="$PWD/deps/ios-deps"
+          [ -f "$IOS_DEPS/device/lib/libgl4es.a" ] || P2_IOS_DEPS="$IOS_DEPS" ios/deps/build.sh device
+          echo "IOS_DEPS=$IOS_DEPS" >> "$GITHUB_ENV"
+
+      - name: Recompile and build the iOS app
+        working-directory: src
+        run: |
+          python3 tools/build_ios.py --game "$GAME" --target device --release --deps "$IOS_DEPS/device"
+          APP=$(eval "$(python3 tools/ios_game.py --game "$GAME" --target device)"; echo "$IOS_APP")
+          echo "APP=$PWD/$APP" >> "$GITHUB_ENV"
+          echo "built: $APP"
+
+      - name: Make the app folder visible in the Files app
+        run: |
+          PB=/usr/libexec/PlistBuddy
+          for k in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+            $PB -c "Set :$k true" "$APP/Info.plist" 2>/dev/null || $PB -c "Add :$k bool true" "$APP/Info.plist"
+          done
+
+      - name: Package IPA
+        run: |
+          set -e
+          NAME=$(basename "$APP" .app)
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          rm -rf "ipa/Payload/$NAME.app/_CodeSignature"
+          (cd ipa && zip -qry "../$NAME-$GAME-unsigned.ipa" Payload)
+          ls -lh *.ipa
+          echo "IPA=$PWD/$NAME-$GAME-unsigned.ipa" >> "$GITHUB_ENV"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.game }}-ipa
+          path: ${{ env.IPA }}
+          retention-days: 3          # it contains Valve's game: keep it short-lived
+          compression-level: 0
